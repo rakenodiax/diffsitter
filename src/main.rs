@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod diff;
 mod formatting;
+mod neg_idx_vec;
 mod parse;
 
 use anyhow::Result;

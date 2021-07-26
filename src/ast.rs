@@ -3,7 +3,7 @@
 use crate::diff::Hunks;
 use anyhow::Result;
 use logging_timer::time;
-use std::{cell::RefCell, ops::Index, path::PathBuf};
+use std::{cell::RefCell, collections::VecDeque, ops::Index, path::PathBuf};
 use tree_sitter::Node as TSNode;
 use tree_sitter::Tree as TSTree;
 
@@ -19,7 +19,7 @@ macro_rules! min {
 /// variant, `Substitution`, that isn't exposed externally. When recreating the edit path,
 /// [Substitution](Edit::Substitution) variant turns into an
 /// [Addition](Edit::Addition) and [Deletion](Internal::Deletion).
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum Edit<'a> {
     /// A no-op
     ///
@@ -77,6 +77,8 @@ pub struct AstVector<'a> {
     /// The full source text that the AST refers to
     pub source_text: &'a str,
 }
+
+impl<'a> Eq for Entry<'a> {}
 
 /// A wrapper struct for AST vector data that owns the data that the AST vector references
 ///
@@ -305,6 +307,172 @@ fn min_edit<'a>(a: &'a AstVector, b: &'a AstVector) -> PredecessorVec<'a> {
     predecessors
 }
 
+/// Input parameters for a diff algorithm
+struct DiffInputs<'a, T: Eq> {
+    /// A slice of comparable objects.
+    ///
+    /// This is considered the "first" input, and an element that's present in `a` but not present
+    /// in `b` is considered a [deletion](EditType::Deletion).
+    pub a: &'a [T],
+
+    /// A slice of comparable objects
+    pub b: &'a [T],
+}
+
+type Diff<T> = VecDeque<EditType<T>>;
+
+/// The different types of elements that can be in an edit script
+#[derive(Debug, Eq, PartialEq)]
+pub enum EditType<T> {
+    /// An element that was added in the edit script
+    Addition(T),
+
+    /// An element that was deleted in the edit script
+    Deletion(T),
+}
+
+/// Implementation of the Myers diff algorithm
+pub mod myers {
+    use std::fmt::Debug;
+
+    use super::*;
+
+    /// Bisect a diff AST to find the "middle snake"
+    ///
+    /// Split a diff into two subproblems along the middle, and recursively construct a diff for
+    /// each half.
+    fn bisect<'a, T>() {}
+
+    /// Compute an edit script from Myers diff states
+    ///
+    /// * `states`: The states from the Myers diff algorithm for each `d`-length path
+    /// * `last_k`: The `k` corresponding to the last found `d`-path
+    fn backtrack<'a, T: PartialEq + Debug>(
+        states: &[Vec<i32>],
+        a: &'a [T],
+        b: &'a [T],
+    ) -> VecDeque<EditType<&'a T>> {
+        println!("a length: {}", a.len());
+        println!("b length: {}", b.len());
+
+        // We know that there can only be `d` states, so we implicitly store the length of the
+        // D-path for the edit graph in the length of the state vector.
+        let max_d = (a.len() + b.len()) as i32;
+        let mut diff = VecDeque::new();
+
+        // We know that the edit graph must end on (m, n), which corresponds to the endpoints of a
+        // and b
+        let mut idx_a = (a.len() - 1) as i32;
+        let mut idx_b = (b.len() - 1) as i32;
+
+        // Iterate backwards through the d-paths to reconstruct the minimal edit path
+        for d in (0..states.len()).rev() {
+            let k = idx_a - idx_b;
+            let k_idx = (k + max_d) as usize;
+            let state = &states[d];
+
+            println!("[1] idx_a: {}, idx_b: {}, k: {}, d: {}", idx_a, idx_b, k, d);
+
+            // Find the previous k value by determining whether the horizontally or vertically
+            // connected d - 1 path is maximal
+            let prev_k_idx = if k == -(d as i32) || state[k_idx - 1] < state[k_idx + 1] {
+                k_idx + 1
+            } else {
+                k_idx - 1
+            };
+            let prev_k = (prev_k_idx as i32) - max_d;
+            let prev_a_idx = state[prev_k_idx];
+            let prev_b_idx = prev_a_idx - (prev_k as i32);
+            println!("prev a: {}, prev b: {}", prev_a_idx, prev_b_idx);
+
+            while idx_a > prev_a_idx && idx_b > prev_b_idx {
+                idx_a -= 1;
+                idx_b -= 1;
+            }
+
+            debug_assert!(idx_b < b.len() as i32);
+            debug_assert!(idx_a < a.len() as i32);
+
+            if (idx_a as i32) == prev_a_idx {
+                diff.push_front(EditType::Addition(&b[idx_b as usize]));
+            } else if (idx_b as i32) == prev_b_idx {
+                diff.push_front(EditType::Deletion(&a[idx_a as usize]));
+            }
+            println!("edit: {:#?}", diff.back());
+
+            idx_a = prev_a_idx;
+            idx_b = prev_b_idx;
+        }
+        diff
+    }
+
+    /// An implementation of the Myers diff algorithm
+    ///
+    /// Generate the minimum edit script between two data slices using an implementation of the Myers
+    /// diff algorithm.
+    // TODO(afnan) switch this back to returning the edit script
+    pub fn diff<'a, T: Eq + Debug>(a: &'a [T], b: &'a [T]) -> Diff<&'a T> {
+        println!("a: {:#?}", a);
+        println!("b: {:#?}", b);
+        // The maximum possible length of an edit script between a and b, if they have no elements in common
+        let max = a.len() + b.len();
+
+        // The states of v at each d
+        let mut states = Vec::new();
+        states.reserve(max + 1);
+
+        // v[k] returns the x coordinate for the largest D path seen on diagonal k + max. We can't have negative indices
+        // so there is an offset of -max applied to the index.
+        // The diagonals range from [-d, d], which is [-max, max]. We offset the k with max when indexing, so we need all
+        // integers in [0, 2 * max] to be indexable in the vector.
+        let mut v: Vec<i32> = vec![0; (2 * max) + 1];
+        let a_len = a.len() as i32;
+        let b_len = b.len() as i32;
+
+        for d in 0..=(max as i32) {
+            for k in (-d..=d).step_by(2) {
+                // We need to convert the unsigned integer to signed before adding to a negative number. We guarantee that
+                // offsetting by max will shift the k index back to the range of [0, max] so we don't have to worry about
+                // an overflow on the outer conversion.
+                let k_idx = (k + (max as i32)) as usize;
+                let go_down = k == -d || v[k_idx - 1] < v[k_idx + 1];
+                let mut x = if go_down {
+                    v[k_idx + 1]
+                } else {
+                    v[k_idx - 1] + 1
+                };
+                let mut y = x - (k as i32);
+
+                // Extend the diagonal snake as far as possible
+                // This isn't a mistake, though the lint seems to find this particular line very suspicious
+                #[allow(clippy::suspicious_operation_groupings)]
+                while x < a_len && y < b_len && a[x as usize] == b[y as usize] {
+                    x += 1;
+                    y += 1;
+                }
+
+                // Once the longest path coordinates have reached (a.len(), b.len()), we know we've found the shortest edit
+                // script that covers the edits between the entirety of both inputs
+                if x >= a_len && y >= b_len {
+                    // backtrack
+                    return backtrack(&states, a, b);
+                }
+
+                println!(
+                    "d: {}, x: {}, y: {}, x len: {}, y len: {}, k: {}",
+                    d, x, y, a_len, b_len, k
+                );
+                //debug_assert!(x <= a_len);
+                //debug_assert!(y <= b_len);
+                v[k_idx as usize] = x;
+            }
+            // Record the state at each `d` so we can backtrack later once we reach the end of the path
+            states.push(v.clone());
+        }
+        backtrack(&states, a, b)
+    }
+}
+
 /// Compute the hunks corresponding to the minimum edit path between two documents
 ///
 /// This method computes the minimum edit distance between two `DiffVector`s, which are the leaf
@@ -320,4 +488,32 @@ fn min_edit<'a>(a: &'a AstVector, b: &'a AstVector) -> PredecessorVec<'a> {
 pub fn edit_hunks<'a>(a: &'a AstVector, b: &'a AstVector) -> Result<(Hunks<'a>, Hunks<'a>)> {
     let predecessors = min_edit(a, b);
     recreate_path((a.len(), b.len()), predecessors)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_case::test_case;
+
+    /*
+    #[test_case(vec![0], vec![0] => 0 ; "When both strings are the same")]
+    #[test_case(vec![0, 0, 0, 0], vec![0, 0, 0, 0] => 0 ; "When both strings are the same (longer)")]
+    #[test_case(vec![0], vec![1] => 2 ; "test substitution")]
+    #[test_case(vec![0], vec![0, 0] => 1 ; "test addition")]
+    #[test_case(vec![3, 0], vec![0, 2] => 2 ; "One edit in each")]
+    fn test_myers(a: Vec<i32>, b: Vec<i32>) -> u32 {
+        let edit_script = myers::diff(&a, &b);
+        println!("{:#?}", edit_script);
+        edit_script.len() as u32
+    }
+
+    #[test]
+    fn test_myers_addition() {
+        let a = vec![0];
+        let b = vec![0, 0];
+        let edit_script: VecDeque<EditType<&i32>> = myers::diff(&a, &b);
+        let expected: VecDeque<EditType<&i32>> = VecDeque::new();
+        assert!(edit_script == expected);
+    }
+    */
 }
